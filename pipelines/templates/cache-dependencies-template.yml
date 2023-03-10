@@ -2,6 +2,16 @@ parameters:
 - name: platform
   type: string
 
+# variables set on VSO: (for security concern)
+#   sas_token
+#
+# its value should be:
+#   sp=racw&st=2022-04-01T00:00:00Z&se=......
+#
+# how to re-generate:
+#   1. find the storage on azure portal: nni (resource group) -> nni (storage account) -> cache (container)
+#   2. settings - shared access tokens - generate sas token and url
+
 steps:
 - template: config-version.yml
   parameters:
@@ -16,6 +26,11 @@ steps:
     cp dependencies/recommended_legacy.txt dependencies/recommended.txt
   displayName: (legacy) Activate legacy dependencies
   condition: and(succeeded(), contains('${{ parameters.platform }}', 'legacy'))
+
+- script: |
+    mv dependencies/recommended_gpu.txt dependencies/recommended.txt
+  displayName: (GPU) Activate CUDA dependencies
+  condition: and(succeeded(), contains('${{ parameters.platform }}', 'gpu'))
 
 - script: |
     set -e
@@ -55,20 +70,37 @@ steps:
   condition: and(succeeded(), contains('${{ parameters.platform }}', 'ubuntu'))
 
 - script: |
-    yarn --cwd ts/nni_manager install
+    cd ts/nni_manager
+    npm install
   displayName: Install NNI Manager dependencies
+  condition: and(succeeded(), not(contains('${{ parameters.platform }}', 'legacy')))
+
+- script: |
+    # make pack_dependencies.py happy
+    mkdir ts/nni_manager/node_modules
+  displayName: (Legacy) Skip NNI Manager dependencies
+  condition: and(succeeded(), contains('${{ parameters.platform }}', 'legacy'))
 
 - script: |
     yarn --cwd ts/webui install
   displayName: Install Web UI dependencies
+  condition: and(succeeded(), not(contains('${{ parameters.platform }}', 'legacy')))
 
 - script: |
-    python test/vso_tools/pack_dependencies.py $(Build.ArtifactStagingDirectory)
+    mkdir ts/webui/node_modules
+  displayName: (Legacy) Skip Web UI dependencies
+  condition: and(succeeded(), contains('${{ parameters.platform }}', 'legacy'))
+
+- script: |
+    python test/vso_tools/pack_dependencies.py dependencies.zip
   displayName: Create cache archive
 
-- task: UniversalPackages@0
-  inputs:
-    command: publish
-    vstsFeedPublish: NNIOpenSource/dependencies
-    vstsFeedPackagePublish: dependencies-${{ parameters.platform }}
-  displayName: Upload cache archive
+- script: |
+    azcopy copy dependencies.zip 'https://nni.blob.core.windows.net/cache/dependencies-${{ parameters.platform }}.zip?$(sas_token)'
+  displayName: (POSIX) Upload cache archive
+  condition: and(succeeded(), not(contains('${{ parameters.platform }}', 'windows')))
+
+- powershell: |
+    azcopy copy dependencies.zip 'https://nni.blob.core.windows.net/cache/dependencies-${{ parameters.platform }}.zip?$(sas_token)'
+  displayName: (Windows) Upload cache archive
+  condition: and(succeeded(), contains('${{ parameters.platform }}', 'windows'))

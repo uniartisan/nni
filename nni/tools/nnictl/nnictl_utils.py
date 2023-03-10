@@ -12,7 +12,6 @@ from functools import cmp_to_key
 import traceback
 from datetime import datetime, timezone
 from subprocess import Popen
-from nni.tools.annotation import expand_annotations
 from .rest_utils import rest_get, rest_delete, check_rest_server_quick, check_response
 from .url_utils import trial_jobs_url, experiment_url, trial_job_id_url, export_data_url, metric_data_url
 from .config_utils import Config, Experiments
@@ -105,7 +104,7 @@ def parse_ids(args):
     3.If there is an id specified, return the corresponding id
     4.If there is no id specified, and there is an experiment running, return the id, or return Error
     5.If the id matches an experiment, nnictl will return the id.
-    6.If the id ends with *, nnictl will match all ids matchs the regular
+    6.If the id ends with ``*``, nnictl will match all ids matchs the regular
     7.If the id does not exist but match the prefix of an experiment id, nnictl will return the matched id
     8.If the id does not exist but match multiple prefix of the experiment ids, nnictl will give id information
     '''
@@ -222,9 +221,22 @@ def stop_experiment(args):
     if experiment_id_list:
         for experiment_id in experiment_id_list:
             print_normal('Stopping experiment %s' % experiment_id)
-            experiments_config = Experiments()
-            experiments_dict = experiments_config.get_all_experiments()
-            rest_pid = experiments_dict.get(experiment_id).get('pid')
+            # FIXME: Retry should be placed to `Experiments`, need review both python and ts code.
+            # retry up to 10 times to get the experiment metadata
+            for i in range(1, 11):
+                experiments_dict = Experiments().get_all_experiments()
+                experiment_info = experiments_dict.get(experiment_id)
+                if experiment_info is None:
+                    print_warning('Get experiment {} metadata failed, {} time retry...'.format(experiment_id, i))
+                    time.sleep(0.5)
+                else:
+                    break
+            if experiment_info is None:
+                print_error('Experiment {} metadata getting failed.'.format(experiment_id))
+                print_error('The experiments metadata in `.experiment` is:')
+                print_error(json.dumps(Experiments().get_all_experiments(), indent=4))
+                exit(1)
+            rest_pid = experiment_info.get('pid')
             if rest_pid:
                 kill_command(rest_pid)
             print_normal('Stop experiment success.')
@@ -297,17 +309,6 @@ def trial_kill(args):
     else:
         print_error('Restful server is not running...')
     return False
-
-def trial_codegen(args):
-    '''Generate code for a specific trial'''
-    print_warning('Currently, this command is only for nni nas programming interface.')
-    exp_id = get_config_filename(args)
-    experiment_config = Config(exp_id, Experiments().get_all_experiments()[exp_id]['logDir']).get_config()
-    if not experiment_config.get('useAnnotation'):
-        print_error('The experiment is not using annotation')
-        exit(1)
-    code_dir = experiment_config['trial']['codeDir']
-    expand_annotations(code_dir, './exp_%s_trial_%s_code'%(exp_id, args.trial_id), exp_id, args.trial_id)
 
 def list_experiment(args):
     '''Get experiment information'''

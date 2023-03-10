@@ -1,10 +1,27 @@
-trigger:
+trigger: none
+
+schedules:
+- cron: 0 16 * * *
   branches:
-    exclude: [ l10n_master ]
+    include: [ master ]
+  always: true
+
+variables:
+  filter.modified.globs: 'pipelines/fast-test.yml,!.github/**,!docs/**,!examples/**'
+  filter.prbody.heading: '#### Test Options'
+  filter.prbody.optionIndex: 0
 
 stages:
 - stage: lint
   jobs:
+
+  - job: copyright
+    pool:
+      vmImage: ubuntu-latest
+    steps:
+    - script: python test/vso_tools/copyright_check.py
+      displayName: Check copyright header
+
   - job: docs
     pool:
       vmImage: ubuntu-latest
@@ -12,31 +29,39 @@ stages:
     - template: templates/install-dependencies.yml
       parameters:
         platform: ubuntu-latest
-        useCache: ${{ eq('$(USE_CACHE)', 'true') }}
-
-    - script: |
-        sudo apt-get install -y pandoc
-      displayName: Install pandoc
 
     - script: |
         cd docs
-        # rstcheck -r source
-      displayName: rstcheck (disabled for now)  # TODO: rstcheck
+        rstcheck -r source \
+          --ignore-directives automodule,autoclass,autofunction,cardlinkitem,codesnippetcard,argparse,tabs,youtube,image-sg \
+          --ignore-roles githublink --ignore-substitutions release \
+          --report-level warning
+      displayName: rstcheck
 
     - script: |
         cd docs
-        make -e SPHINXOPTS="-W --keep-going -T" html
+        sphinx-build -W --keep-going -T -q source build/html
       displayName: Sphinx sanity check
 
     - script: |
+        set -e
         cd docs
-        make -e SPHINXOPTS="-W --keep-going -T -D language='zh'" html
+        sudo apt-get install -y gettext
+        python tools/translation_patch.py
+        sphinx-build -W --keep-going -T -q -D language=zh source build/html_zh
       displayName: Sphinx sanity check (Chinese)
 
     - script: |
+        set -e
         cd docs
-        python tools/chineselink.py check
+        make i18n
+        git diff --exit-code source/locales
       displayName: Translation up-to-date
+
+    - script: |
+        cd docs
+        sphinx-build -b linkcheck -W --keep-going -T -q source build/linkcheck
+      displayName: External links integrity check
 
   - job: python
     pool:
@@ -45,12 +70,14 @@ stages:
     - template: templates/install-dependencies.yml
       parameters:
         platform: ubuntu-latest
-        useCache: ${{ eq('$(USE_CACHE)', 'true') }}
 
     - script: |
         # pylint requires newer typing extension. Override requirements in tensorflow
         python -m pip install "typing-extensions>=3.10"
       displayName: Resolve dependency version
+
+    - script: python test/vso_tools/trigger_import.py
+      displayName: Trigger import
 
     - script: |
         python -m pylint --rcfile pylintrc nni
@@ -63,6 +90,10 @@ stages:
         python -m flake8 examples --count --exclude=$EXCLUDES --select=E9,F63,F72,F82 --show-source --statistics
       displayName: flake8
 
+    - script: |
+        python -m pyright nni
+      displayName: Type Check
+
   - job: typescript
     pool:
       vmImage: ubuntu-latest
@@ -70,12 +101,11 @@ stages:
     - template: templates/install-dependencies.yml
       parameters:
         platform: ubuntu-latest
-        useCache: ${{ eq('$(USE_CACHE)', 'true') }}
 
     - script: |
         set -e
-        yarn --cwd ts/nni_manager
-        yarn --cwd ts/nni_manager eslint
+        npm --prefix ts/nni_manager install
+        npm --prefix ts/nni_manager run eslint
       displayName: ESLint (NNI Manager)
 
     - script: |
@@ -84,10 +114,20 @@ stages:
         yarn --cwd ts/webui sanity-check
       displayName: Sanity check (WebUI)
 
+- stage: filter
+  jobs:
+  - job: check
+    pool:
+      vmImage: ubuntu-latest
+    steps:
+    - template: templates/stage-filter.yml
 
   # To reduce debug cost, steps are sorted differently on each platform,
   # so that a bug in any module will cause at least one platform to fail quickly.
 - stage: test
+  dependsOn: lint
+  # dependencies.$(StageName).outputs['$(JobName).$(TaskName).$(VariableName)']
+  condition: and(succeeded(), ne(dependencies.filter.outputs['check.execution.skipsubsequent'], 'true'))
   jobs:
   - job: ubuntu_latest
     pool:
@@ -97,31 +137,20 @@ stages:
     - template: templates/install-dependencies.yml
       parameters:
         platform: ubuntu-latest
-        useCache: ${{ eq('$(USE_CACHE)', 'true') }}
 
-    - script: |
-        python setup.py develop
-        echo "##vso[task.setvariable variable=PATH]${HOME}/.local/bin:${PATH}"
-      displayName: Install NNI
+    - template: templates/install-nni.yml
 
     - script: |
         set -e
         mkdir -p coverage
         cd test
-        python -m pytest ut --cov-config=.coveragerc \
-          --ignore=ut/compression/v1/test_pruners.py \
-          --ignore=ut/compression/v1/test_compressor_tf.py \
-          --ignore=ut/compression/v1/test_compressor_torch.py \
-          --ignore=ut/compression/v1/test_model_speedup.py
-        python -m pytest ut/compression/v1/test_pruners.py --cov-config=.coveragerc --cov-append
-        python -m pytest ut/compression/v1/test_compressor_tf.py --cov-config=.coveragerc --cov-append
-        python -m pytest ut/compression/v1/test_compressor_torch.py --cov-config=.coveragerc --cov-append
-        python -m pytest ut/compression/v1/test_model_speedup.py --cov-config=.coveragerc --cov-append
+        python -m pytest ut --cov-config=.coveragerc
         cp coverage.xml ../coverage/python.xml
       displayName: Python unit test
 
     - script: |
-        yarn --cwd ts/nni_manager test
+        set -e
+        npm --prefix ts/nni_manager run test
         cp ts/nni_manager/coverage/cobertura-coverage.xml coverage/typescript.xml
       displayName: TypeScript unit test
 
@@ -140,27 +169,23 @@ stages:
 
     - script: |
         cd test
-        python nni_test/nnitest/run_tests.py --config config/pr_tests.yml
+        python training_service/nnitest/run_tests.py --config training_service/config/pr_tests.yml
       displayName: Simple integration test
 
   - job: ubuntu_legacy
     pool:
-      vmImage: ubuntu-18.04
+      vmImage: ubuntu-20.04
 
     steps:
     - template: templates/install-dependencies.yml
       parameters:
         platform: ubuntu-legacy
-        useCache: ${{ eq('$(USE_CACHE)', 'true') }}
 
-    - script: |
-        python setup.py develop
-        echo "##vso[task.setvariable variable=PATH]${HOME}/.local/bin:${PATH}"
-      displayName: Install NNI
+    - template: templates/install-nni.yml
 
     - script: |
         cd test
-        python nni_test/nnitest/run_tests.py --config config/pr_tests.yml
+        python training_service/nnitest/run_tests.py --config training_service/config/pr_tests.yml
       displayName: Simple integration test
 
     - script: |
@@ -171,7 +196,8 @@ stages:
       displayName: Python unit test
 
     - script: |
-        yarn --cwd ts/nni_manager test
+        export PATH=${PWD}/toolchain/node/bin:$PATH
+        npm --prefix ts/nni_manager run test
       displayName: TypeScript unit test
 
   - job: windows
@@ -183,24 +209,24 @@ stages:
     - template: templates/install-dependencies.yml
       parameters:
         platform: windows
-        useCache: ${{ eq('$(USE_CACHE)', 'true') }}
 
-    - script: |
-        python setup.py develop --no-user
-      displayName: Install NNI
+    - template: templates/install-nni.yml
+      parameters:
+        user: false
 
     - script: |
         cd test
         python -m pytest ut
       displayName: Python unit test
 
-    - script: |
-        yarn --cwd ts/nni_manager test
-      displayName: TypeScript unit test
+    # temporarily disable this test, add it back after bug fixed
+    # - script: |
+    #     npm --prefix ts/nni_manager run test
+    #   displayName: TypeScript unit test
 
     - script: |
         cd test
-        python nni_test/nnitest/run_tests.py --config config/pr_tests.yml
+        python training_service/nnitest/run_tests.py --config training_service/config/pr_tests.yml
       displayName: Simple integration test
 
   - job: macos
@@ -211,16 +237,8 @@ stages:
     - template: templates/install-dependencies.yml
       parameters:
         platform: macos
-        useCache: ${{ eq('$(USE_CACHE)', 'true') }}
 
-    - script: |
-        python setup.py develop
-        echo "##vso[task.setvariable variable=PATH]${HOME}/.local/bin:${PATH}"
-      displayName: Install NNI
-
-    - script: |
-        CI=true yarn --cwd ts/nni_manager test --exclude test/core/nnimanager.test.ts
-      displayName: TypeScript unit test
+    - template: templates/install-nni.yml
 
     - script: |
         cd test
@@ -228,6 +246,10 @@ stages:
       displayName: Python unit test
 
     - script: |
+        CI=true npm --prefix ts/nni_manager run test --exclude test/core/nnimanager.test.ts
+      displayName: TypeScript unit test
+
+    - script: |
         cd test
-        python nni_test/nnitest/run_tests.py --config config/pr_tests.yml
+        python training_service/nnitest/run_tests.py --config training_service/config/pr_tests.yml
       displayName: Simple integration test

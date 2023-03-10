@@ -10,7 +10,7 @@ import tkill from 'tree-kill';
 import { NNIError, NNIErrorNames } from 'common/errors';
 import { getExperimentId } from 'common/experimentStartupInfo';
 import { getLogger, Logger } from 'common/log';
-import { powershellString } from 'common/shellUtils';
+import { powershellString, shellString, createScriptFile } from 'common/shellUtils';
 import {
     HyperParameters, TrainingService, TrialJobApplicationForm,
     TrialJobDetail, TrialJobMetric, TrialJobStatus
@@ -106,7 +106,7 @@ class LocalTrainingService implements TrainingService {
             this.gpuScheduler = new GPUScheduler();
         }
 
-        if (this.config.gpuIndices === []) {
+        if (this.config.gpuIndices && this.config.gpuIndices.length === 0) {
             throw new Error('gpuIndices cannot be empty when specified.');
         }
 
@@ -193,7 +193,7 @@ class LocalTrainingService implements TrainingService {
     }
 
     public submitTrialJob(form: TrialJobApplicationForm): Promise<TrialJobDetail> {
-        const trialJobId: string = uniqueString(5);
+        const trialJobId: string = form.id === undefined ? uniqueString(5) : form.id;
         const trialJobDetail: LocalTrialJobDetail = new LocalTrialJobDetail(
             trialJobId,
             'WAITING',
@@ -413,17 +413,18 @@ class LocalTrainingService implements TrainingService {
 
     private getScript(workingDirectory: string): string[] {
         const script: string[] = [];
+        const escapedCommand = shellString(this.config.trialCommand);
         if (process.platform === 'win32') {
             script.push(`$PSDefaultParameterValues = @{'Out-File:Encoding' = 'utf8'}`);
             script.push(`cd $env:NNI_CODE_DIR`);
             script.push(
-                `cmd.exe /c ${this.config.trialCommand} 1>${path.join(workingDirectory, 'stdout')} 2>${path.join(workingDirectory, 'stderr')}`,
+                `cmd.exe /c ${escapedCommand} 1>${path.join(workingDirectory, 'stdout')} 2>${path.join(workingDirectory, 'stderr')}`,
                 `$NOW_DATE = [int64](([datetime]::UtcNow)-(get-date "1/1/1970")).TotalSeconds`,
                 `$NOW_DATE = "$NOW_DATE" + (Get-Date -Format fff).ToString()`,
                 `Write $LASTEXITCODE " " $NOW_DATE  | Out-File "${path.join(workingDirectory, '.nni', 'state')}" -NoNewline -encoding utf8`);
         } else {
             script.push(`cd $NNI_CODE_DIR`);
-            script.push(`eval ${this.config.trialCommand} 1>${path.join(workingDirectory, 'stdout')} 2>${path.join(workingDirectory, 'stderr')}`);
+            script.push(`eval ${escapedCommand} 1>${path.join(workingDirectory, 'stdout')} 2>${path.join(workingDirectory, 'stderr')}`);
             if (process.platform === 'darwin') {
                 // https://superuser.com/questions/599072/how-to-get-bash-execution-time-in-milliseconds-under-mac-os-x
                 // Considering the worst case, write 999 to avoid negative duration
@@ -457,8 +458,8 @@ class LocalTrainingService implements TrainingService {
         await execMkdir(path.join(trialJobDetail.workingDirectory, '.nni'));
         await execNewFile(path.join(trialJobDetail.workingDirectory, '.nni', 'metrics'));
         const scriptName: string = getScriptName('run');
-        await fs.promises.writeFile(path.join(trialJobDetail.workingDirectory, scriptName),
-                                    runScriptContent.join(getNewLine()), { encoding: 'utf8', mode: 0o777 });
+        await createScriptFile(path.join(trialJobDetail.workingDirectory, scriptName),
+                runScriptContent.join(getNewLine()));
         await this.writeParameterFile(trialJobDetail.workingDirectory, trialJobDetail.form.hyperParameters);
         const trialJobProcess: cp.ChildProcess = runScript(path.join(trialJobDetail.workingDirectory, scriptName));
         this.setTrialJobStatus(trialJobDetail, 'RUNNING');

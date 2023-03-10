@@ -1,9 +1,9 @@
 import * as JSON5 from 'json5';
 import axios from 'axios';
 import { IContextualMenuProps } from '@fluentui/react';
-import { MANAGER_IP, RETIARIIPARAMETERS } from './const';
+import { RETIARIIPARAMETERS } from './const';
 import { EXPERIMENT } from './datamodel';
-import { MetricDataRecord, FinalType, TableObj, Tensorboard } from './interface';
+import { MetricDataRecord, FinalType, TensorboardTaskInfo } from './interface';
 
 function getPrefix(): string | undefined {
     const pathName = window.location.pathname;
@@ -71,12 +71,41 @@ const convertDuration = (seconds: number): string => {
     }
     seconds -= m * 60;
 
-    if (seconds > 0) {
+    // don't show `0s`
+    if (Math.floor(seconds) > 0) {
         str += `${Math.floor(seconds)}s`;
     }
     return str ? str : '0s';
 };
 
+const formatTimeStyle = (seconds: number): string => {
+    // 1d2h3m4s
+    let str = '';
+
+    const d = Math.floor(seconds / (24 * 3600));
+    if (d > 0) {
+        str += `<b>${d}</b><span>d</span>`;
+    }
+    seconds -= d * 24 * 3600;
+
+    const h = Math.floor(seconds / 3600);
+    if (h > 0) {
+        str += `<b>${h}</b><span>h</span>`;
+    }
+    seconds -= h * 3600;
+
+    const m = Math.floor(seconds / 60);
+    if (m > 0) {
+        str += `<b>${m}</b><span>m</span>`;
+    }
+    seconds -= m * 60;
+
+    // don't show `0s`
+    if (Math.floor(seconds) > 0) {
+        str += `<b>${Math.floor(seconds)}</b><span>s</span>`;
+    }
+    return str;
+};
 // according the unit(d,h,m) to convert duration
 function convertTimeAsUnit(unit: string, value: number): number {
     let divisor = 1;
@@ -187,46 +216,6 @@ const intermediateGraphOption = (intermediateArr: number[], id: string): any => 
     };
 };
 
-// kill job
-const killJob = (key: number, id: string, status: string, updateList?: Function): void => {
-    axios(`${MANAGER_IP}/trial-jobs/${id}`, {
-        method: 'DELETE',
-        headers: {
-            'Content-Type': 'application/json;charset=utf-8'
-        }
-    })
-        .then(res => {
-            if (res.status === 200) {
-                // TODO: use Message.txt to tooltip
-                alert('Cancel the job successfully');
-                // render the table
-                if (updateList) {
-                    updateList(); // FIXME
-                }
-            } else {
-                alert('fail to cancel the job');
-            }
-        })
-        .catch(error => {
-            if (error.response.status === 500) {
-                if (error.response.data.error) {
-                    alert(error.response.data.error);
-                } else {
-                    alert('500 error, fail to cancel the job');
-                }
-            }
-        });
-};
-
-const filterByStatus = (item: TableObj): boolean => {
-    return item.status === 'SUCCEEDED';
-};
-
-// a waittiong trial may havn't start time
-const filterDuration = (item: TableObj): boolean => {
-    return item.status !== 'WAITING';
-};
-
 const downFile = (content: string, fileName: string): void => {
     const aTag = document.createElement('a');
     const isEdge = navigator.userAgent.indexOf('Edge') !== -1 ? true : false;
@@ -284,7 +273,8 @@ function formatComplexTypeValue(value: any): string | number {
     if (['number', 'string'].includes(typeof value)) {
         return value;
     } else {
-        return value.toString();
+        // for hpo experiment: search space choice value is None, and it shows null
+        return String(value);
     }
 }
 
@@ -324,7 +314,7 @@ function copyAndSort<T>(items: T[], columnKey: string, isSortedDescending?: bool
     });
 }
 
-function disableTensorboard(selectedRowIds: string[], queryTensorboardList: Tensorboard[]): boolean {
+function disableTensorboard(selectedRowIds: string[], queryTensorboardList: TensorboardTaskInfo[]): boolean {
     let flag = true;
 
     if (selectedRowIds.length !== 0) {
@@ -338,7 +328,11 @@ function disableTensorboard(selectedRowIds: string[], queryTensorboardList: Tens
     return flag;
 }
 
-function getTensorboardMenu(queryTensorboardList: Tensorboard[], stopFunc, seeDetailFunc): IContextualMenuProps {
+function getTensorboardMenu(
+    queryTensorboardList: TensorboardTaskInfo[],
+    stopFunc,
+    seeDetailFunc
+): IContextualMenuProps {
     const result: Array<object> = [];
     if (queryTensorboardList.length !== 0) {
         result.push({
@@ -380,6 +374,54 @@ const reformatRetiariiParameter = (parameters: any): {} => {
     return RETIARIIPARAMETERS in parameters ? parameters[RETIARIIPARAMETERS] : parameters;
 };
 
+function _inferColumnTitle(columnKey: string): string {
+    if (columnKey === 'sequenceId') {
+        return 'Trial No.';
+    } else if (columnKey === 'id') {
+        return 'ID';
+    } else if (columnKey === 'intermediateCount') {
+        return 'Intermediate results (#)';
+    } else if (columnKey === 'message') {
+        return 'Message';
+    } else if (columnKey.startsWith('space/')) {
+        return columnKey.split('/', 2)[1] + ' (space)';
+    } else if (columnKey === 'latestAccuracy') {
+        return 'Default metric'; // to align with the original design
+    } else if (columnKey.startsWith('metric/')) {
+        return columnKey.split('/', 2)[1] + ' (metric)';
+    } else if (columnKey.startsWith('_')) {
+        return columnKey;
+    } else {
+        // camel case to verbose form
+        const withSpace = columnKey.replace(/[A-Z]/g, letter => ` ${letter.toLowerCase()}`);
+        return withSpace.charAt(0).toUpperCase() + withSpace.slice(1);
+    }
+}
+
+const getIntermediateAllKeys = (intermediateDialogTrial: any): string[] => {
+    let intermediateAllKeysList: string[] = [];
+    if (intermediateDialogTrial!.intermediates !== undefined && intermediateDialogTrial!.intermediates[0]) {
+        const parsedMetric = parseMetrics(intermediateDialogTrial!.intermediates[0].data);
+        if (parsedMetric !== undefined && typeof parsedMetric === 'object') {
+            const allIntermediateKeys: string[] = [];
+            // just add type=number keys
+            for (const key in parsedMetric) {
+                if (typeof parsedMetric[key] === 'number') {
+                    allIntermediateKeys.push(key);
+                }
+            }
+            intermediateAllKeysList = allIntermediateKeys;
+        }
+    }
+
+    if (intermediateAllKeysList.includes('default') && intermediateAllKeysList[0] !== 'default') {
+        intermediateAllKeysList = intermediateAllKeysList.filter(item => item !== 'default');
+        intermediateAllKeysList.unshift('default');
+    }
+
+    return intermediateAllKeysList;
+};
+
 export {
     getPrefix,
     convertTime,
@@ -389,11 +431,9 @@ export {
     getFinal,
     downFile,
     intermediateGraphOption,
-    killJob,
-    filterByStatus,
-    filterDuration,
     formatAccuracy,
     formatTimestamp,
+    formatTimeStyle,
     expformatTimestamp,
     metricAccuracy,
     parseMetrics,
@@ -407,5 +447,7 @@ export {
     disableTensorboard,
     getTensorboardMenu,
     parametersType,
-    reformatRetiariiParameter
+    reformatRetiariiParameter,
+    getIntermediateAllKeys,
+    _inferColumnTitle
 };

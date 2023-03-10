@@ -1,7 +1,6 @@
 // Copyright (c) Microsoft Corporation.
 // Licensed under the MIT license.
 
-// eslint-disable-next-line @typescript-eslint/camelcase
 import {Client1_10, config} from 'kubernetes-client';
 import {getLogger, Logger} from 'common/log';
 
@@ -150,6 +149,7 @@ abstract class KubernetesCRDClient {
     protected readonly client: any;
     protected readonly log: Logger = getLogger('KubernetesCRDClient');
     protected crdSchema: any;
+    public namespace: string = 'default';
 
     constructor() {
         this.client = new Client1_10({config: getKubernetesConfig()});

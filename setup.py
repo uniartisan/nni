@@ -27,7 +27,7 @@ Uninstall:
 
   $ pip uninstall nni
 
-Remove generated files: (use "--all" to remove toolchain and built wheel)
+Remove generated files: (use "--all" to remove built wheel)
 
   $ python setup.py clean [--all]
 
@@ -112,6 +112,7 @@ def _setup():
         packages = _find_python_packages(),
         package_data = {
             'nni': _find_requirements_txt() + _find_default_config(),  # setuptools issue #1806
+            'nni_assets': _find_asset_files(),
             'nni_node': _find_node_files()  # note: this does not work before building
         },
 
@@ -120,10 +121,12 @@ def _setup():
         python_requires = '>=3.7',
         install_requires = _read_requirements_txt('dependencies/required.txt'),
         extras_require = {
+            'Anneal': _read_requirements_txt('dependencies/required_extra.txt', 'Anneal'),
             'SMAC': _read_requirements_txt('dependencies/required_extra.txt', 'SMAC'),
             'BOHB': _read_requirements_txt('dependencies/required_extra.txt', 'BOHB'),
             'PPOTuner': _read_requirements_txt('dependencies/required_extra.txt', 'PPOTuner'),
             'DNGO': _read_requirements_txt('dependencies/required_extra.txt', 'DNGO'),
+            'all': _read_requirements_txt('dependencies/required_extra.txt'),
         },
         setup_requires = ['requests'],
 
@@ -153,7 +156,7 @@ def _find_python_packages():
     for dirpath, dirnames, filenames in os.walk('nni'):
         if '/__pycache__' not in dirpath and '/.mypy_cache' not in dirpath and '/default_config' not in dirpath:
             packages.append(dirpath.replace('/', '.'))
-    return sorted(packages) + ['nni_node']
+    return sorted(packages) + ['nni_assets', 'nni_node']
 
 def _find_requirements_txt():
     requirement_files = []
@@ -164,6 +167,14 @@ def _find_requirements_txt():
 
 def _find_default_config():
     return ['runtime/default_config/' + name for name in os.listdir('nni/runtime/default_config')]
+
+def _find_asset_files():
+    files = []
+    for dirpath, dirnames, filenames in os.walk('nni_assets'):
+        for filename in filenames:
+            if os.path.splitext(filename)[1] == '.py':
+                files.append(os.path.join(dirpath[len('nni_assets/'):], filename))
+    return sorted(files)
 
 def _find_node_files():
     if not os.path.exists('nni_node'):
@@ -221,7 +232,7 @@ class Build(build):
         check_jupyter_lab_version()
 
         if os.path.islink('nni_node/main.js'):
-            sys.exit('A development build already exists. Please uninstall NNI and run "python3 setup.py clean --all".')
+            sys.exit('A development build already exists. Please uninstall NNI and run "python3 setup.py clean".')
         open('nni/version.py', 'w').write(f"__version__ = '{release}'")
         super().run()
 
@@ -259,7 +270,7 @@ class Clean(clean):
 
     def run(self):
         super().run()
-        setup_ts.clean(self._all)
+        setup_ts.clean()
         _clean_temp_files()
         shutil.rmtree('nni.egg-info', ignore_errors=True)
         if self._all:
@@ -279,7 +290,9 @@ _temp_files = [
     'test/model_path/',
     'test/temp.json',
     'test/ut/sdk/*.pth',
-    'test/ut/tools/annotation/_generated/'
+
+    # example
+    'nni_assets/**/data/',
 ]
 
 

@@ -12,8 +12,8 @@ STD_DELTA = 1e-6
 
 
 class AutoMaskInference:
-    def __init__(self, module, dummy_input, in_masks=None, weight_mask=None, \
-                output_mask=None, name=None, in_constants=None, state_dict=None, batch_dim=0):
+    def __init__(self, module, dummy_input, speedup, in_masks=None, weight_mask=None,
+                 output_mask=None, name=None, in_constants=None, state_dict=None):
         """
         This class will infer the mask of the target module automatically.
         This update_direct_sparsity will infer the output mask according
@@ -28,6 +28,8 @@ class AutoMaskInference:
             The target module to infer the mask. Need to be callable.
         dummy_input: torch.Tensor/list of Tensor
             The dummy_input of the target module.
+        speedup: ModelSpeedup
+            The reference of the ModelSpeedup object.
         in_masks:  list of torch.Tensor
             The input masks of the target module, if in_masks is not None, then
             update_direct_sparsity and update_indirect_sparsity will incrementally
@@ -47,8 +49,6 @@ class AutoMaskInference:
             The correponding constant values of the in_masks.
         state_dict: dict of torch.Tensor
             The original values of the weights.
-        batch_dim: int
-            The index of the batch dimension of the input tensors.
 
         """
         errmsg = '%s is not callable, should pass the nn.Module/function' % str(
@@ -82,13 +82,19 @@ class AutoMaskInference:
         if output_mask is not None:
             # assume the given output mask is right
             self.output_mask = output_mask
+        elif isinstance(module, (nn.GroupNorm, nn.LayerNorm)):
+            self.output_mask = self.in_masks[0]
         else:
             if isinstance(self.output, torch.Tensor):
+                if self.output.requires_grad:
+                    self.output.retain_grad()   # issue #5299
                 self.output_mask = torch.ones_like(self.output)
             elif isinstance(self.output, list) or isinstance(self.output, tuple):
                 self.output_mask = []
                 for o_tensor in self.output:
                     if isinstance(o_tensor, torch.Tensor):
+                        if o_tensor.requires_grad:
+                            o_tensor.retain_grad()  # issue #5299
                         self.output_mask.append(torch.ones_like(o_tensor))
                     else:
                         # if one of the outputs is not tensor, set the corresponding
@@ -112,7 +118,8 @@ class AutoMaskInference:
                     self.weight_mask[name] = torch.ones_like(para.data)
         self.state_dict = state_dict
         # TODO support the other batch dimension in the future
-        self.batch_dim = batch_dim
+        self.batch_dim = speedup.batch_dim
+        self.batch_size = speedup.confidence
 
     def random_init(self, start=0.1, end=8.0):
         """
@@ -124,13 +131,24 @@ class AutoMaskInference:
         # when the confidence is low. In the future, we will add the mask inference
         # rules for ReLU6 to break this range constraint.
         with torch.no_grad():
-            for tensor in self.dummy_input:
-                if isinstance(tensor, torch.Tensor) and len(tensor.size()) > 0:
-                    # if the tensor is a scalar, then skip this tensor
+            for index, tensor in enumerate(self.dummy_input):
+                # NOTE: tensor.size(self.batch_dim) % self.batch_size == 0 is a workaround,
+                # sometimes batch_dim size might be dynamic internal,
+                # i.e., input size is (batch_size * node_num, seq_len, hidden_size),
+                # this workaround only deal with these situations.
+                if isinstance(tensor, torch.Tensor) and len(tensor.size()) > self.batch_dim \
+                    and tensor.size(self.batch_dim) % self.batch_size == 0:
+                    # if the input tensor only has one dimension, which means
+                    # it doesn't have the batch dimension, then we don't randomize
+                    # this tensor, because our tensor scrambling is on the batch
+                    # dimention. For example, if the tensor is a scalar(returned
+                    # by the size operator), then we will skip this tensor
+                    if not tensor.is_contiguous():
+                        tensor = tensor.contiguous()
+                        self.dummy_input[index] = tensor
                     randomize_tensor(tensor, start, end)
             for para in self.weights:
                 randomize_tensor(self.weights[para].data, start, end)
-
 
     def zero_grad(self):
         """
@@ -239,7 +257,6 @@ class AutoMaskInference:
             out_mask[:, mask_pos] = 0
             constant[:, mask_pos] = mean[mask_pos]
         return out_mask, constant
-
 
     def update_indirect_sparsity(self):
         """
@@ -379,4 +396,3 @@ class AutoMaskInference:
 
     def get_masks(self):
         return (self.in_masks, self.output_mask, self.weight_mask)
-

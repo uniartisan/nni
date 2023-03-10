@@ -1,18 +1,14 @@
 # Copyright (c) Microsoft Corporation.
 # Licensed under the MIT license.
 
-from getpass import getuser
 import logging
 from pathlib import Path
-import tempfile
 
 from colorama import Fore
 import yaml
 
 from nni.experiment import Experiment, RunMode
 from nni.experiment.config import ExperimentConfig, convert, utils
-from nni.runtime.log import init_logger_for_command_line
-from nni.tools.annotation import expand_annotations, generate_search_space
 
 # used for v1-only legacy setup, remove them later
 from nni.experiment.launcher import get_stopped_experiment_config_json
@@ -28,16 +24,11 @@ def create_experiment(args):
     url_prefix = args.url_prefix
     foreground = args.foreground
 
-    # it should finally be done in nnictl main function
-    # but for now don't break routines without logging support
-    init_logger_for_command_line()
-    logging.getLogger('nni').setLevel(logging.INFO)
-
     if not config_file.is_file():
         _logger.error(f'"{config_file}" is not a valid file.')
         exit(1)
 
-    with config_file.open() as config:
+    with config_file.open(encoding='utf_8') as config:
         config_content = yaml.safe_load(config)
 
     v1_platform = config_content.get('trainingServicePlatform')
@@ -77,22 +68,20 @@ def create_experiment(args):
         config = ExperimentConfig.load(config_file)
 
     if config.use_annotation:
-        path = Path(tempfile.gettempdir(), getuser(), 'nni', 'annotation')
-        path.mkdir(parents=True, exist_ok=True)
-        path = tempfile.mkdtemp(dir=path)
-        code_dir = expand_annotations(config.trial_code_directory, path)
-        config.trial_code_directory = code_dir
-        config.search_space = generate_search_space(code_dir)
-        assert config.search_space, 'ERROR: Generated search space is empty'
-        config.use_annotation = False
+        _logger.error('You are using annotation to specify search space. This is not supported since NNI v3.0.')
+        exit(1)
 
     exp = Experiment(config)
     exp.url_prefix = url_prefix
-    run_mode = RunMode.Foreground if foreground else RunMode.Detach
-    exp.start(port, debug, run_mode)
 
-    _logger.info(f'To stop experiment run "nnictl stop {exp.id}" or "nnictl stop --all"')
-    _logger.info('Reference: https://nni.readthedocs.io/en/stable/Tutorial/Nnictl.html')
+    if foreground:
+        exp.start(port, debug, RunMode.Foreground)
+        exp._wait_completion()
+
+    else:
+        exp.start(port, debug, RunMode.Detach)
+        _logger.info(f'To stop experiment run "nnictl stop {exp.id}" or "nnictl stop --all"')
+        _logger.info('Reference: https://nni.readthedocs.io/en/stable/reference/nnictl.html')
 
 def resume_experiment(args):
     exp_id = args.id
@@ -101,30 +90,41 @@ def resume_experiment(args):
     foreground = args.foreground
     exp_dir = args.experiment_dir
 
-    init_logger_for_command_line()
-    logging.getLogger('nni').setLevel(logging.INFO)
-
+    # NOTE: Backward compatibility
     config_json = get_stopped_experiment_config_json(exp_id, exp_dir)
     if config_json.get('trainingServicePlatform'):
         legacy_launcher.resume_experiment(args)
         exit()
 
-    exp = Experiment._resume(exp_id, exp_dir)
-    run_mode = RunMode.Foreground if foreground else RunMode.Detach
-    exp.start(port, debug, run_mode)
+    config = ExperimentConfig(**config_json)
+    if type(config) != ExperimentConfig:
+        _logger.error('Non-HPO experiment cannot be resumed with nnictl. Please use experiment.resume() in Python API.')
+        exit(1)
+
+    experiment = Experiment(config, id=exp_id)
+    # Do not need to call `load_checkpoint()` here as there is nothing to load.
+    experiment._action = 'resume'
+    # Can't use experiment.resume() here because resume() will automatically run in RunMode.Background,
+    # and thus the NNI manager process will be killed once the main process exits.
+    experiment.start(port, debug, RunMode.Foreground if foreground else RunMode.Detach)
 
 def view_experiment(args):
     exp_id = args.id
     port = args.port
     exp_dir = args.experiment_dir
 
-    init_logger_for_command_line()
-    logging.getLogger('nni').setLevel(logging.INFO)
-
+    # NOTE: Backward compatibility
     config_json = get_stopped_experiment_config_json(exp_id, exp_dir)
     if config_json.get('trainingServicePlatform'):
         legacy_launcher.view_experiment(args)
         exit()
 
-    exp = Experiment._view(exp_id, exp_dir)
-    exp.start(port, run_mode=RunMode.Detach)
+    config = ExperimentConfig(**config_json)
+    if type(config) != ExperimentConfig:
+        _logger.warning(
+            'Non-HPO experiment detected. '
+            'Though `nnictl view` is designed to be agnostic to experiment types, it is only tested to view HPO experiments. '
+            'Report an issue if you encounter any problem.'
+        )
+
+    Experiment(config, id=exp_id).view(port, non_blocking=True)  # non-blocking is in detach mode.

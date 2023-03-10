@@ -1,46 +1,37 @@
 import * as React from 'react';
+import { Outlet } from 'react-router-dom';
 import { Stack } from '@fluentui/react';
-import { COLUMN } from './static/const';
-import { EXPERIMENT, TRIALS } from './static/datamodel';
-import { isManagerExperimentPage } from './static/function';
-import NavCon from './components/NavCon';
-import MessageInfo from './components/modals/MessageInfo';
-import { SlideNavBtns } from './components/slideNav/SlideNavBtns';
+import { EXPERIMENT, TRIALS } from '@static/datamodel';
+import NavCon from '@components/nav/Nav';
+import MessageInfo from '@components/common/MessageInfo';
+import { COLUMN } from '@static/const';
+import { isManagerExperimentPage } from '@static/function';
+import '@style/App.scss';
+import '@style/common/common.scss';
+import '@style/experiment/trialdetail/trialsDetail.scss';
+
 const echarts = require('echarts/lib/echarts');
 echarts.registerTheme('nni_theme', {
     color: '#3c8dbc'
 });
-import './App.scss';
-import './static/style/common.scss';
-import './static/style/trialsDetail.scss';
-
-interface AppState {
-    interval: number;
-    columnList: string[];
-    experimentUpdateBroadcast: number;
-    trialsUpdateBroadcast: number;
-    maxDurationUnit: string;
-    metricGraphMode: 'max' | 'min'; // tuner's optimize_mode filed
-    isillegalFinal: boolean;
-    expWarningMessage: string;
-    bestTrialEntries: string; // for overview page: best trial entreis
-    isUpdate: boolean;
-    expandRowIDs: Set<string>;
-}
 
 export const AppContext = React.createContext({
     interval: 10, // sendons
     columnList: COLUMN,
     experimentUpdateBroadcast: 0,
     trialsUpdateBroadcast: 0,
-    metricGraphMode: 'max',
+    metricGraphMode: 'Maximize',
     bestTrialEntries: '10',
     maxDurationUnit: 'm',
     expandRowIDs: new Set(['']),
+    expandRowIDsDetailTable: new Set(['']),
+    selectedRowIds: [] as string[],
+    // eslint-disable-next-line @typescript-eslint/no-empty-function
+    changeSelectedRowIds: (_val: string[]): void => {},
     // eslint-disable-next-line @typescript-eslint/no-empty-function
     changeColumn: (_val: string[]): void => {},
     // eslint-disable-next-line @typescript-eslint/no-empty-function
-    changeMetricGraphMode: (_val: 'max' | 'min'): void => {},
+    changeMetricGraphMode: (_val: 'Maximize' | 'Minimize'): void => {},
     // eslint-disable-next-line @typescript-eslint/no-empty-function
     changeMaxDurationUnit: (_val: string): void => {},
     // eslint-disable-next-line @typescript-eslint/no-empty-function
@@ -50,12 +41,36 @@ export const AppContext = React.createContext({
     // eslint-disable-next-line @typescript-eslint/no-empty-function
     updateDetailPage: () => {},
     // eslint-disable-next-line @typescript-eslint/no-empty-function
-    changeExpandRowIDs: (_val: string, _type?: string): void => {}
+    changeExpandRowIDs: (_val: string, _type?: string): void => {},
+    // eslint-disable-next-line @typescript-eslint/no-empty-function
+    changeExpandRowIDsDetailTable: (_val: string, _type?: string): void => {},
+    // eslint-disable-next-line @typescript-eslint/no-empty-function
+    startTimer: () => {},
+    // eslint-disable-next-line @typescript-eslint/no-empty-function
+    closeTimer: (): void => {},
+    // eslint-disable-next-line @typescript-eslint/no-empty-function
+    refreshDetailTable: (): void => {}
 });
 
+interface AppState {
+    interval: number;
+    columnList: string[];
+    experimentUpdateBroadcast: number;
+    trialsUpdateBroadcast: number;
+    maxDurationUnit: string;
+    metricGraphMode: 'Maximize' | 'Minimize'; // tuner's optimize_mode filed
+    isillegalFinal: boolean;
+    expWarningMessage: string;
+    bestTrialEntries: string; // for overview page: best trial entreis
+    expandRowIDs: Set<string>; // for overview page: open row
+    expandRowIDsDetailTable: Set<string>; // for overview page: open row
+    selectedRowIds: string[]; // for detail page: selected trial - checkbox
+    timerIdList: number[];
+}
+
 class App extends React.Component<{}, AppState> {
-    private timerId!: number | undefined;
-    private firstLoad: boolean = false; // when click refresh selector options
+    private timerId = 0;
+
     constructor(props: {}) {
         super(props);
         this.state = {
@@ -63,90 +78,29 @@ class App extends React.Component<{}, AppState> {
             columnList: COLUMN,
             experimentUpdateBroadcast: 0,
             trialsUpdateBroadcast: 0,
-            metricGraphMode: 'max',
+            metricGraphMode: 'Maximize',
             maxDurationUnit: 'm',
             isillegalFinal: false,
             expWarningMessage: '',
             bestTrialEntries: '10',
-            isUpdate: true,
-            expandRowIDs: new Set()
+            expandRowIDs: new Set(),
+            expandRowIDsDetailTable: new Set(),
+            selectedRowIds: [],
+            timerIdList: []
         };
     }
 
     async componentDidMount(): Promise<void> {
+        localStorage.removeItem('columns');
+        localStorage.removeItem('paraColumns');
         await Promise.all([EXPERIMENT.init(), TRIALS.init()]);
         this.setState(state => ({
             experimentUpdateBroadcast: state.experimentUpdateBroadcast + 1,
             trialsUpdateBroadcast: state.trialsUpdateBroadcast + 1,
-            metricGraphMode: EXPERIMENT.optimizeMode === 'minimize' ? 'min' : 'max'
+            metricGraphMode: EXPERIMENT.optimizeMode === 'minimize' ? 'Minimize' : 'Maximize'
         }));
-        this.timerId = window.setTimeout(this.refresh, this.state.interval * 100);
-    }
 
-    changeInterval = (interval: number): void => {
-        window.clearTimeout(this.timerId);
-        if (interval === 0) {
-            return;
-        }
-        // setState will trigger page refresh at once.
-        // setState is asyc, interval not update to (this.state.interval) at once.
-        this.setState({ interval }, () => {
-            this.firstLoad = true;
-            this.refresh();
-        });
-    };
-
-    // TODO: use local storage
-    changeColumn = (columnList: string[]): void => {
-        this.setState({ columnList: columnList });
-    };
-
-    changeExpandRowIDs = (id: string, type?: string): void => {
-        const currentExpandRowIDs = this.state.expandRowIDs;
-
-        if (!currentExpandRowIDs.has(id)) {
-            currentExpandRowIDs.add(id);
-        } else {
-            if (!(type !== undefined && type === 'chart')) {
-                currentExpandRowIDs.delete(id);
-            }
-        }
-
-        this.setState({ expandRowIDs: currentExpandRowIDs });
-    };
-
-    changeMetricGraphMode = (val: 'max' | 'min'): void => {
-        this.setState({ metricGraphMode: val });
-    };
-
-    // overview best trial module
-    changeEntries = (entries: string): void => {
-        this.setState({ bestTrialEntries: entries });
-    };
-
-    // overview max duration unit
-    changeMaxDurationUnit = (unit: string): void => {
-        this.setState({ maxDurationUnit: unit });
-    };
-
-    updateOverviewPage = (): void => {
-        this.setState(state => ({
-            experimentUpdateBroadcast: state.experimentUpdateBroadcast + 1
-        }));
-    };
-
-    updateDetailPage = (): void => {
-        this.setState(state => ({
-            trialsUpdateBroadcast: state.trialsUpdateBroadcast + 1
-        }));
-    };
-
-    shouldComponentUpdate(nextProps: any, nextState: AppState): boolean {
-        if (!(nextState.isUpdate || nextState.isUpdate === undefined)) {
-            nextState.isUpdate = true;
-            return false;
-        }
-        return true;
+        this.startTimer();
     }
 
     render(): React.ReactNode {
@@ -160,10 +114,12 @@ class App extends React.Component<{}, AppState> {
             expWarningMessage,
             bestTrialEntries,
             maxDurationUnit,
-            expandRowIDs
+            expandRowIDs,
+            expandRowIDsDetailTable,
+            selectedRowIds
         } = this.state;
         if (experimentUpdateBroadcast === 0 || trialsUpdateBroadcast === 0) {
-            return null; // TODO: render a loading page
+            return null;
         }
         const errorList = [
             { errorWhere: TRIALS.jobListError(), errorMessage: TRIALS.getJobErrorMessage() },
@@ -180,13 +136,11 @@ class App extends React.Component<{}, AppState> {
                     <Stack className='nni' style={{ minHeight: window.innerHeight }}>
                         <div className='header'>
                             <div className='headerCon'>
-                                <NavCon changeInterval={this.changeInterval} refreshFunction={this.lastRefresh} />
+                                <NavCon changeInterval={this.changeInterval} />
                             </div>
                         </div>
                         <Stack className='contentBox'>
                             <Stack className='content'>
-                                {/* search space & config */}
-                                <SlideNavBtns />
                                 {/* if api has error field, show error message */}
                                 {errorList.map(
                                     (item, key) =>
@@ -201,6 +155,7 @@ class App extends React.Component<{}, AppState> {
                                         <MessageInfo info={expWarningMessage} typeInfo='warning' />
                                     </div>
                                 )}
+                                {/* <AppContext.Provider */}
                                 <AppContext.Provider
                                     value={{
                                         interval,
@@ -210,16 +165,24 @@ class App extends React.Component<{}, AppState> {
                                         trialsUpdateBroadcast,
                                         metricGraphMode,
                                         maxDurationUnit,
+                                        bestTrialEntries,
                                         changeMaxDurationUnit: this.changeMaxDurationUnit,
                                         changeMetricGraphMode: this.changeMetricGraphMode,
-                                        bestTrialEntries,
                                         changeEntries: this.changeEntries,
-                                        updateOverviewPage: this.updateOverviewPage,
-                                        updateDetailPage: this.updateDetailPage,
                                         expandRowIDs,
-                                        changeExpandRowIDs: this.changeExpandRowIDs
+                                        expandRowIDsDetailTable,
+                                        selectedRowIds,
+                                        changeSelectedRowIds: this.changeSelectedRowIds,
+                                        changeExpandRowIDs: this.changeExpandRowIDs,
+                                        changeExpandRowIDsDetailTable: this.changeExpandRowIDsDetailTable,
+                                        updateOverviewPage: this.updateOverviewPage,
+                                        updateDetailPage: this.updateDetailPage, // update current record without fetch api
+                                        refreshDetailTable: this.refreshDetailTable, // update record with fetch api
+                                        startTimer: this.startTimer,
+                                        closeTimer: this.closeTimer
                                     }}
                                 >
+                                    <Outlet />
                                     {this.props.children}
                                 </AppContext.Provider>
                             </Stack>
@@ -231,38 +194,125 @@ class App extends React.Component<{}, AppState> {
     }
 
     private refresh = async (): Promise<void> => {
-        // resolve this question: 10s -> 20s, page refresh twice.
-        // only refresh this page after clicking the refresh options
-        if (this.firstLoad !== true) {
-            const [experimentUpdated, trialsUpdated] = await Promise.all([EXPERIMENT.update(), TRIALS.update()]);
-            if (experimentUpdated) {
-                this.setState(state => ({ experimentUpdateBroadcast: state.experimentUpdateBroadcast + 1 }));
-            }
-            if (trialsUpdated) {
-                this.setState(state => ({ trialsUpdateBroadcast: state.trialsUpdateBroadcast + 1 }));
-            }
-        } else {
-            this.firstLoad = false;
+        const [experimentUpdated, trialsUpdated] = await Promise.all([EXPERIMENT.update(), TRIALS.update()]);
+        if (experimentUpdated) {
+            this.setState(state => ({ experimentUpdateBroadcast: state.experimentUpdateBroadcast + 1 }));
+        }
+        if (trialsUpdated) {
+            this.setState(state => ({ trialsUpdateBroadcast: state.trialsUpdateBroadcast + 1 }));
         }
 
         // experiment status and /trial-jobs api's status could decide website update
         if (['DONE', 'ERROR', 'STOPPED', 'VIEWED'].includes(EXPERIMENT.status) || TRIALS.jobListError()) {
             // experiment finished, refresh once more to ensure consistency
-            this.setState(() => ({ interval: 0, isUpdate: false }));
+            this.setState(() => ({ interval: 0 }));
+            this.closeTimer();
             return;
         }
 
-        this.timerId = window.setTimeout(this.refresh, this.state.interval * 1000);
+        this.startTimer();
     };
 
-    public async lastRefresh(): Promise<void> {
+    public lastRefresh = async (): Promise<void> => {
         await EXPERIMENT.update();
         await TRIALS.update(true);
         this.setState(state => ({
             experimentUpdateBroadcast: state.experimentUpdateBroadcast + 1,
             trialsUpdateBroadcast: state.trialsUpdateBroadcast + 1
         }));
-    }
+    };
+
+    public changeInterval = (interval: number): void => {
+        this.setState(() => ({ interval: interval })); // reset interval val
+        this.closeTimer(); // close page auto refresh
+        if (interval !== 0) {
+            this.refresh();
+        }
+    };
+
+    public changeColumn = (columnList: string[]): void => {
+        this.setState({ columnList: columnList });
+    };
+
+    // for succeed table in the overview page
+    public changeExpandRowIDs = (id: string, type?: string): void => {
+        const currentExpandRowIDs = this.state.expandRowIDs;
+
+        if (!currentExpandRowIDs.has(id)) {
+            currentExpandRowIDs.add(id);
+        } else {
+            if (!(type !== undefined && type === 'chart')) {
+                currentExpandRowIDs.delete(id);
+            }
+        }
+
+        this.setState({ expandRowIDs: currentExpandRowIDs });
+    };
+
+    // for details table in the detail page
+    public changeExpandRowIDsDetailTable = (id: string): void => {
+        const currentExpandRowIDs = this.state.expandRowIDsDetailTable;
+
+        if (!currentExpandRowIDs.has(id)) {
+            currentExpandRowIDs.add(id);
+        } else {
+            currentExpandRowIDs.delete(id);
+        }
+
+        this.setState({ expandRowIDsDetailTable: currentExpandRowIDs });
+    };
+
+    public changeSelectedRowIds = (val: string[]): void => {
+        this.setState({ selectedRowIds: val });
+    };
+    public changeMetricGraphMode = (val: 'Maximize' | 'Minimize'): void => {
+        this.setState({ metricGraphMode: val });
+    };
+
+    // overview best trial module
+    public changeEntries = (entries: string): void => {
+        this.setState({ bestTrialEntries: entries });
+    };
+
+    // overview max duration unit
+    public changeMaxDurationUnit = (unit: string): void => {
+        this.setState({ maxDurationUnit: unit });
+    };
+
+    public updateOverviewPage = (): void => {
+        this.setState(state => ({
+            experimentUpdateBroadcast: state.experimentUpdateBroadcast + 1
+        }));
+    };
+
+    public updateDetailPage = async (): Promise<void> => {
+        this.setState(state => ({
+            trialsUpdateBroadcast: state.trialsUpdateBroadcast + 1
+        }));
+    };
+
+    // fetch api to update table record data
+    public refreshDetailTable = async (): Promise<void> => {
+        await TRIALS.update(true);
+        this.setState(state => ({
+            trialsUpdateBroadcast: state.trialsUpdateBroadcast + 1
+        }));
+    };
+
+    // start to refresh page automatically
+    public startTimer = (): void => {
+        this.timerId = window.setTimeout(this.refresh, this.state.interval * 1000);
+        const storeTimerList = this.state.timerIdList;
+        storeTimerList.push(this.timerId);
+        this.setState(() => ({ timerIdList: storeTimerList }));
+    };
+
+    public closeTimer = (): void => {
+        const { timerIdList } = this.state;
+        timerIdList.forEach(item => {
+            window.clearTimeout(item);
+        });
+    };
 }
 
 export default App;

@@ -6,21 +6,28 @@ import logging
 import torch
 import numpy as np
 from nni.compression.pytorch.compressor import PrunerModuleWrapper
-from nni.algorithms.compression.v2.pytorch.base import PrunerModuleWrapper as PrunerModuleWrapper_v2
+from nni.compression.pytorch.base import PrunerModuleWrapper as PrunerModuleWrapper_v2
 from .utils import get_module_by_name
 
 
-__all__ = ['ChannelDependency', 'GroupDependency',
+__all__ = ['ChannelDependency', 'GroupDependency', 'ReshapeDependency',
            'InputChannelDependency', 'AttentionWeightDependency']
 
 
 CONV_TYPE = 'aten::_convolution'
-ADD_TYPES = ['aten::add', 'aten::add_']
-MUL_TYPES = ['aten::mul', 'atem::mul_']
+ADD_MUL_LOGICAL_TYPES = [
+    'aten::add', 'aten::add_', 'aten::sub', 'aten::sub_', 'aten::subtract', 'aten::subtract_',
+    'aten::mul', 'aten::mul_', 'aten::div', 'aten::div_', 'aten::multiply', 'aten::multiply_', 'aten::divide', 'aten::divide_',
+    'aten::addcmul', 'aten::addcmul_',
+    'aten::addcdiv', 'aten::addcdiv_',
+    'aten::logical_xor', 'aten::logical_xor_',
+    'aten::logical_and', 'aten::logical_and_',
+    'aten::logical_or', 'aten::logical_or_',
+]
 CAT_TYPE = 'aten::cat'
 logger = logging.getLogger('Shape_Dependency')
 RESHAPE_OPS = [CAT_TYPE, 'aten::view',
-               'aten::reshape', 'aten::flatten', 'aten::mean']
+               'aten::reshape', 'aten::flatten', 'aten::mean', 'aten::expand_as', 'aten::pixel_shuffle']
 
 
 def lcm_list(L):
@@ -49,7 +56,7 @@ class Dependency:
             # user should provide model & dummy_input to trace
             # the model or a already traced model
             assert model is not None and dummy_input is not None
-        self.graph = TorchModuleGraph(model, dummy_input, traced_model)
+        self.graph: TorchModuleGraph = TorchModuleGraph(model, dummy_input, traced_model)
         self.model = model
         self.dependency = dict()
         self.build_dependency()
@@ -85,36 +92,46 @@ def reshape_break_channel_dependency(op_node):
     """
     in_shape = op_node.auxiliary['in_shape']
     out_shape = op_node.auxiliary['out_shape']
+    # FIXME: e.g., in_shape will be None if the input comes from a buffer, should be fixed in next release
+    if not in_shape or not out_shape:
+        return True
+    if len(in_shape) <= 1 or len(out_shape) <= 1:
+        return True
     in_channel = in_shape[1]
     out_channel = out_shape[1]
     return in_channel != out_channel
 
 
 class ChannelDependency(Dependency):
+    """
+    This model analyze the channel dependencies between the conv
+    layers in a model.
+
+    Parameters
+    ----------
+    model : torch.nn.Module
+        The model to be analyzed.
+    data : torch.Tensor
+        The example input data to trace the network architecture.
+    traced_model : torch._C.Graph
+        if we alreay has the traced graph of the target model, we donnot
+        need to trace the model again.
+    prune_type: str
+        This parameter indicates the channel pruning type: 1) `Filter`
+        prune the filter of the convolution layer to prune the corresponding
+        channels 2) `Batchnorm`: prune the channel in the batchnorm layer
+    """
+
     def __init__(self, model, dummy_input, traced_model=None, prune_type='Filter'):
-        """
-        This model analyze the channel dependencies between the conv
-        layers in a model.
-        Parameters
-        ----------
-        model : torch.nn.Module
-            The model to be analyzed.
-        data : torch.Tensor
-            The example input data to trace the network architecture.
-        traced_model : torch._C.Graph
-            if we alreay has the traced graph of the target model, we donnot
-            need to trace the model again.
-        prune_type: str
-            This parameter indicates the channel pruning type: 1) `Filter`
-            prune the filter of the convolution layer to prune the corresponding
-            channels 2) `Batchnorm`: prune the channel in the batchnorm layer
-        """
         self.prune_type = prune_type
         self.target_types = []
         if self.prune_type == 'Filter':
-            self.target_types.extend(['Conv2d', 'Linear', 'ConvTranspose2d'])
+            self.target_types.extend(['Conv2d', 'Linear', 'ConvTranspose2d', 'Embedding'])
         elif self.prune_type == 'Batchnorm':
             self.target_types.append('BatchNorm2d')
+
+        from typing import Dict, Set
+        self.dependency: Dict[str, Set[str]]
 
         super(ChannelDependency, self).__init__(
             model, dummy_input, traced_model)
@@ -135,8 +152,12 @@ class ChannelDependency(Dependency):
         parent_layers = []
         queue = []
         queue.append(node)
+        visited_set = set()
         while queue:
             curnode = queue.pop(0)
+            if curnode in visited_set:
+                continue
+            visited_set.add(curnode)
             if curnode.op_type in self.target_types:
                 # find the first met conv
                 parent_layers.append(curnode.name)
@@ -147,6 +168,8 @@ class ChannelDependency(Dependency):
             parents = self.graph.find_predecessors(curnode.unique_name)
             parents = [self.graph.name_to_node[name] for name in parents]
             for parent in parents:
+                if parent in visited_set:
+                    continue
                 queue.append(parent)
 
         return parent_layers
@@ -163,7 +186,7 @@ class ChannelDependency(Dependency):
             parent_layers = []
             # find the node that contains aten::add
             # or aten::cat operations
-            if node.op_type in ADD_TYPES or node.op_type in MUL_TYPES:
+            if node.op_type in ADD_MUL_LOGICAL_TYPES:
                 # refer issue 4540 for more details. Multiplication actually
                 # will not introduce the channel dependency, cause the misaligned
                 # channels can propagate to each other. However, when one of the input
@@ -186,6 +209,17 @@ class ChannelDependency(Dependency):
                         break
                 if cat_dim != 1:
                     parent_layers = self._get_parent_layers(node)
+
+            # additional denpendency for (group number == output channel number) depth-wise conv
+            if node.op_type in ['Conv2d', 'ConvTranspose2d', "GroupNorm"]:
+                if node.op_type in ['Conv2d', 'ConvTranspose2d']:
+                    condition = self._conv_condition(node)
+                elif node.op_type == "GroupNorm":
+                    condition = self._group_norm_condition(node)
+                if condition:
+                    parent_layers.append(node.name)
+                    parent_layers.extend(self._depthwise_get_parent(node))
+
             dependency_set = set(parent_layers)
             # merge the dependencies
             for parent in parent_layers:
@@ -194,6 +228,43 @@ class ChannelDependency(Dependency):
             # save the dependencies
             for _node in dependency_set:
                 self.dependency[_node] = dependency_set
+
+    def _conv_condition(self, node_group):
+        node_name = node_group.name
+        _, leaf_module = get_module_by_name(self.model, node_name)
+        if isinstance(leaf_module, (PrunerModuleWrapper, PrunerModuleWrapper_v2)):
+            leaf_module = leaf_module.module
+        assert isinstance(
+            leaf_module, (torch.nn.Conv2d, torch.nn.ConvTranspose2d))
+        group = leaf_module.groups
+        n_filter = leaf_module.out_channels
+        return n_filter == group
+
+    def _group_norm_condition(self, node_group) -> int:
+        node_name = node_group.name
+        _, leaf_module = get_module_by_name(self.model, node_name)
+        if isinstance(leaf_module, (PrunerModuleWrapper, PrunerModuleWrapper_v2)):
+            leaf_module = leaf_module.module
+        assert isinstance(leaf_module, (torch.nn.GroupNorm))
+        return leaf_module.num_groups == leaf_module.num_channels
+
+    def _depthwise_get_parent(self, node):
+        parent_layers = []
+        # the input node is a Conv node
+        predeessors = self.graph.find_predecessors(node.unique_name)
+        predeessors = [self.graph.name_to_node[x] for x in predeessors]
+        queue = predeessors
+        while queue:
+            curnode = queue.pop(0)
+            if curnode.op_type == 'Conv2d' or curnode.op_type == 'ConvTranspose2d' or curnode.op_type == 'Linear':
+                # find the first met conv
+                parent_layers.append(curnode.name)
+                continue
+            parents = self.graph.find_predecessors(curnode.unique_name)
+            parents = [self.graph.name_to_node[name] for name in parents]
+            for parent in parents:
+                queue.append(parent)
+        return parent_layers
 
     def export(self, filepath):
         """
@@ -277,6 +348,7 @@ class InputChannelDependency(ChannelDependency):
         """
         This model analyze the input channel dependencies between the conv
         layers in a model.
+
         Parameters
         ----------
         model : torch.nn.Module
@@ -335,20 +407,22 @@ class InputChannelDependency(ChannelDependency):
 
 
 class GroupDependency(Dependency):
+    """
+    This model analyze the group dependencis between the conv
+    layers in a model.
+
+    Parameters
+    ----------
+    model : torch.nn.Module
+        The model to be analyzed.
+    dummy_input : torch.Tensor
+        The example input data to trace the network architecture.
+    traced_model : torch._C.Graph
+        if we alreay has the traced graph of the target model, we donnot
+        need to trace the model again.
+    """
+
     def __init__(self, model, dummy_input, traced_model=None):
-        """
-        This model analyze the group dependencis between the conv
-        layers in a model.
-        Parameters
-        ----------
-        model : torch.nn.Module
-            The model to be analyzed.
-        data : torch.Tensor
-            The example input data to trace the network architecture.
-        traced_model : torch._C.Graph
-            if we alreay has the traced graph of the target model, we donnot
-            need to trace the model again.
-        """
         self.min_groups = {}
         super(GroupDependency, self).__init__(model, dummy_input, traced_model)
 
@@ -373,7 +447,7 @@ class GroupDependency(Dependency):
         queue = predeessors
         while queue:
             curnode = queue.pop(0)
-            if curnode.op_type == 'Conv2d' or curnode.op_type == 'ConvTranspose2d':
+            if curnode.op_type == 'Conv2d' or curnode.op_type == 'ConvTranspose2d' or curnode.op_type == 'Linear':
                 # find the first met conv
                 parent_layers.append(curnode.name)
                 continue
@@ -408,6 +482,29 @@ class GroupDependency(Dependency):
             return 1
         return group
 
+    def _get_group_norm_condition(self, node_group) -> int:
+        """
+        Get the number of groups for a group norm layer.
+
+        Parameters
+        ----------
+        node_group : NodePyGroup
+            target node.
+        Returns
+        -------
+        condition: int
+            the number that layer's num channel
+            require to be divisible to
+        """
+        node_name = node_group.name
+        _, leaf_module = get_module_by_name(self.model, node_name)
+        if isinstance(leaf_module, (PrunerModuleWrapper, PrunerModuleWrapper_v2)):
+            leaf_module = leaf_module.module
+        assert isinstance(leaf_module, (torch.nn.GroupNorm))
+
+        return leaf_module.num_groups
+
+
     def build_dependency(self):
         """
         Build the channel dependency for the conv layers
@@ -431,8 +528,11 @@ class GroupDependency(Dependency):
         """
         self.groups = {}
         for node in self.graph.nodes_py.nodes_op:
-            if node.op_type == 'Conv2d' or node.op_type == 'ConvTranspose2d':
-                group = self._get_conv_groups(node)
+            if node.op_type in ['Conv2d', 'ConvTranspose2d', "GroupNorm"]:
+                if node.op_type in ['Conv2d', 'ConvTranspose2d']:
+                    group = self._get_conv_groups(node)
+                elif node.op_type == "GroupNorm":
+                    group = self._get_group_norm_condition(node)
                 if node.name in self.groups:
                     # the conv layer whose group is larger than 1 will require that
                     # it's number of output channel to be divisible by the number of group.

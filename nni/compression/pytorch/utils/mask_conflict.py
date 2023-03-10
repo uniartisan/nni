@@ -10,6 +10,7 @@ from .utils import get_module_by_name
 _logger = logging.getLogger('FixMaskConflict')
 
 
+# TODO: mask conflict need refactor, the current implementation is very unfriendly to the input channel masks.
 def fix_mask_conflict(masks, model, dummy_input, traced=None):
     """
     MaskConflict fix the mask conflict for the channel dependencies
@@ -45,7 +46,19 @@ def fix_mask_conflict(masks, model, dummy_input, traced=None):
         if torch.__version__ >= '1.6.0':
             # only pytorch with version greater than 1.6.0 has the strict option
             kw_args['strict'] = False
-        traced = torch.jit.trace(model, dummy_input, **kw_args)
+        try:
+            import pytorch_lightning as pl
+        except ImportError:
+            is_lightning_module = False
+        else:
+            if isinstance(model, pl.LightningModule):
+                is_lightning_module = True
+            else:
+                is_lightning_module = False
+        if is_lightning_module:
+            traced = model.to_torchscript(method="trace", example_inputs=dummy_input, **kw_args)
+        else:
+            traced = torch.jit.trace(model, dummy_input, **kw_args)
         model.train(training)
 
     fix_group_mask = GroupMaskConflict(masks, model, dummy_input, traced)
@@ -81,23 +94,23 @@ class MaskFix:
 
 
 class GroupMaskConflict(MaskFix):
-    def __init__(self, masks, model, dummy_input, traced=None):
-        """
-        GroupMaskConflict fix the mask conflict between the layers that
-        has group dependecy with each other.
+    """
+    GroupMaskConflict fix the mask conflict between the layers that
+    has group dependecy with each other.
 
-        Parameters
-        ----------
-        masks : dict
-            a dict object that stores the masks
-        model : torch.nn.Module
-            model to fix the mask conflict
-        dummy_input : torch.Tensor
-            input example to trace the model
-        traced : torch._C.torch.jit.TopLevelTracedModule
-            the traced model of the target model, is this parameter is not None,
-            we donnot use the model and dummpy_input to get the trace graph.
-        """
+    Parameters
+    ----------
+    masks : dict
+        a dict object that stores the masks
+    model : torch.nn.Module
+        model to fix the mask conflict
+    dummy_input : torch.Tensor
+        input example to trace the model
+    traced : torch._C.torch.jit.TopLevelTracedModule
+        the traced model of the target model, is this parameter is not None,
+        we donnot use the model and dummpy_input to get the trace graph.
+    """
+    def __init__(self, masks, model, dummy_input, traced=None):
         super(GroupMaskConflict, self).__init__(
             masks, model, dummy_input, traced)
 
@@ -115,7 +128,7 @@ class GroupMaskConflict(MaskFix):
         for layername in depens:
             group_max = depens[layername]
             group_min = min_groups[layername]
-            if layername not in self.masks:
+            if layername not in self.masks or 'weight' not in self.masks[layername]:
                 # this layer not pruned
                 continue
             w_mask = self.masks[layername]['weight']
@@ -168,23 +181,24 @@ class GroupMaskConflict(MaskFix):
 
 
 class ChannelMaskConflict(MaskFix):
-    def __init__(self, masks, model, dummy_input, traced=None):
-        """
-        ChannelMaskConflict fix the mask conflict between the layers that
-        has channel dependecy with each other.
+    """
+    ChannelMaskConflict fix the mask conflict between the layers that
+    has channel dependecy with each other.
 
-        Parameters
-        ----------
-        masks : dict
-            a dict object that stores the masks
-        model : torch.nn.Module
-            model to fix the mask conflict
-        dummy_input : torch.Tensor
-            input example to trace the model
-        graph : torch._C.torch.jit.TopLevelTracedModule
-            the traced graph of the target model, is this parameter is not None,
-            we donnot use the model and dummpy_input to get the trace graph.
-        """
+    Parameters
+    ----------
+    masks : dict
+        a dict object that stores the masks
+    model : torch.nn.Module
+        model to fix the mask conflict
+    dummy_input : torch.Tensor
+        input example to trace the model
+    graph : torch._C.torch.jit.TopLevelTracedModule
+        the traced graph of the target model, is this parameter is not None,
+        we donnot use the model and dummpy_input to get the trace graph.
+    """
+
+    def __init__(self, masks, model, dummy_input, traced=None):
         super(ChannelMaskConflict, self).__init__(
             masks, model, dummy_input, traced)
         self.conv_prune_dim = detect_mask_prune_dim(masks, model)
@@ -209,7 +223,7 @@ class ChannelMaskConflict(MaskFix):
         sum_idx = (1, 2, 3) if self.conv_prune_dim == 0 else (0, 2, 3)
 
         (_tmp_name, _tmp_tensor) = list(self.masks.items())[0]
-        device = _tmp_tensor['weight'].device
+        device = list(_tmp_tensor.values())[0].device
 
         for dset in depen_sets:
             if len(dset) <= 1:
@@ -220,12 +234,14 @@ class ChannelMaskConflict(MaskFix):
             channel_masks = []
             fine_grained = False
             for name in dset:
-                if name in self.masks:
+                if name in self.masks and 'weight' in self.masks[name]:
                     _, m = get_module_by_name(self.model, name)
                     assert m is not None
                     mask = self.masks[name]['weight']
                     if type(m).__name__ == 'Conv2d':
                         channel_mask = (mask.abs().sum(sum_idx) != 0).int()
+                        if self.conv_prune_dim == 1:
+                            channel_mask = channel_mask.repeat(m.groups)
                         channel_masks.append(channel_mask)
                         if (channel_mask.sum() * (mask.numel() / mask.shape[self.conv_prune_dim])).item() != (mask > 0).sum().item():
                             fine_grained = True
@@ -236,6 +252,10 @@ class ChannelMaskConflict(MaskFix):
                         else:
                             channel_masks.append(
                                 (mask.abs().sum(1) != 0).int())
+                    elif type(m).__name__ == 'Embedding':
+                        if self.conv_prune_dim == 0:
+                            channel_masks.append(
+                                (mask.abs().sum(0) != 0).int())
                     elif type(m).__name__ == 'BatchNorm2d':
                         channel_masks.append(mask.int())
                     elif type(m).__name__ == 'ConvTranspose2d':
@@ -244,6 +264,8 @@ class ChannelMaskConflict(MaskFix):
                         tmp_sum_idx = (
                             0, 2, 3) if self.conv_prune_dim == 0 else (1, 2, 3)
                         channel_mask = (mask.abs().sum(tmp_sum_idx) != 0).int()
+                        if self.conv_prune_dim == 0:
+                            channel_mask = channel_mask.repeat(m.groups)
                         channel_masks.append(channel_mask)
                         if (channel_mask.sum() * (mask.numel() / mask.shape[1 - self.conv_prune_dim])).item() != (mask > 0).sum().item():
                             fine_grained = True
@@ -277,7 +299,7 @@ class ChannelMaskConflict(MaskFix):
             merged_index = torch.nonzero(merged_channel_mask, as_tuple=True)[0]
 
             for name in dset:
-                if name not in self.masks:
+                if name not in self.masks or 'weight' not in self.masks[name]:
                     assert all(merged_channel_mask)
                     continue
                 orig_mask = self.masks[name]['weight']
@@ -287,11 +309,14 @@ class ChannelMaskConflict(MaskFix):
                     if self.conv_prune_dim == 0:
                         new_mask[merged_index, :, :, :] = 1.
                     else:
-                        new_mask[:, merged_index, :, :] = 1.
+                        new_mask[:, torch.nonzero(merged_channel_mask[:new_mask.shape[1]], as_tuple=True)[0], :, :] = 1.
                 elif type(m).__name__ == 'Linear':
                     if self.conv_prune_dim == 0:
-                        new_mask[merged_index, :] = 1
+                        new_mask[merged_index, :] = 1.
                     elif self.conv_prune_dim == 1:
+                        new_mask[:, merged_index] = 1.
+                elif type(m).__name__ == 'Embedding':
+                    if self.conv_prune_dim == 0:
                         new_mask[:, merged_index] = 1.
                 elif type(m).__name__ == 'BatchNorm2d':
                     new_mask = merged_channel_mask.type_as(orig_mask)
@@ -300,8 +325,6 @@ class ChannelMaskConflict(MaskFix):
                         f'unsupported module type: {type(m).__name__}')
                 self.masks[name]['weight'] = new_mask
                 if 'bias' in self.masks[name] and self.masks[name]['bias'] is not None:
-                    if type(m).__name__ == 'Conv2d':
-                        assert self.conv_prune_dim == 0
                     if self.conv_prune_dim == 0:
                         self.masks[name]['bias'] = merged_channel_mask.type_as(
                             self.masks[name]['bias'])
@@ -364,6 +387,9 @@ def detect_mask_prune_dim(masks, model):
     dim0_preserved, dim1_preserved = 0., 0.
     dim0_num, dim1_num = 0., 0.
     for module_name in masks:
+        if 'weight' not in masks[module_name]:
+            continue
+
         _, m = get_module_by_name(model, module_name)
         if m is None or type(m).__name__ != 'Conv2d':
             continue

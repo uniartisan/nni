@@ -2,14 +2,22 @@
 // Licensed under the MIT license.
 
 import { spawn } from 'child_process';
+import globals from './globals';
 import { Logger, getLogger } from './log';
 
 const logger: Logger = getLogger('pythonScript');
 
-const python: string = process.platform === 'win32' ? 'python.exe' : 'python3';
+export function runPythonScript(script: string, logTag?: string): Promise<string> {
+    return runPython([ '-c', script ], logTag);
+}
 
-export async function runPythonScript(script: string, logTag?: string): Promise<string> {
-    const proc = spawn(python, [ '-c', script ]);
+export function runPythonModule(moduleName: string, args?: string[]): Promise<string> {
+    const argsArr = args ?? [];
+    return runPython([ '-m', moduleName , ...argsArr ], moduleName);
+}
+
+export async function runPython(args: string[], logTag?: string): Promise<string> {
+    const proc = spawn(globals.args.pythonInterpreter, args);
 
     let stdout: string = '';
     let stderr: string = '';
@@ -24,10 +32,10 @@ export async function runPythonScript(script: string, logTag?: string): Promise<
 
     if (stderr) {
         if (logTag) {
-            logger.warning(`Python script [${logTag}] has stderr:`, stderr);
+            logger.warning(`Python command [${logTag}] has stderr:`, stderr);
         } else {
-            logger.warning('Python script has stderr.');
-            logger.warning('  script:', script);
+            logger.warning('Python command has stderr.');
+            logger.warning('  args:', args);
             logger.warning('  stderr:', stderr);
         }
     }

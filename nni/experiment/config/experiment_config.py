@@ -12,6 +12,7 @@ import json
 import logging
 from pathlib import Path
 from typing import Any, List, Optional, Union
+from typing_extensions import Literal
 
 import yaml
 
@@ -61,6 +62,7 @@ class ExperimentConfig(ConfigBase):
     # In latter case hybrid training services can have different settings.
 
     experiment_name: Optional[str] = None
+    experiment_type: Literal['hpo'] = 'hpo'
     search_space_file: Optional[utils.PathLike] = None
     search_space: Any = None
     trial_command: Optional[str] = None  # training service field
@@ -81,6 +83,20 @@ class ExperimentConfig(ConfigBase):
     advisor: Optional[_AlgorithmConfig] = None
     training_service: Union[TrainingServiceConfig, List[TrainingServiceConfig]]
     shared_storage: Optional[SharedStorageConfig] = None
+
+    def __new__(cls, *args, **kwargs) -> 'ExperimentConfig':
+        if cls is not ExperimentConfig:
+            # The __new__ only applies to the base class.
+            return super().__new__(cls)
+        if kwargs.get('experimentType') == 'nas':
+            # Loaded by JSON or YAML.
+            # Send the kwargs to the NAS config constructor.
+            # TODO: uncomment this when NAS part is done.
+            # from nni.nas.experiment import NasExperimentConfig
+            # return NasExperimentConfig.__new__(NasExperimentConfig)
+            raise NotImplementedError('NAS experiment is not supported yet.')
+        else:
+            return super().__new__(cls)
 
     def __init__(self, training_service_platform=None, **kwargs):
         super().__init__(**kwargs)
@@ -110,8 +126,21 @@ class ExperimentConfig(ConfigBase):
 
         for algo_type in ['tuner', 'assessor', 'advisor']:
             algo = getattr(self, algo_type)
-            if algo is not None and algo.name == '_none_':
+
+            # TODO: need a more universal solution for similar problems
+            if isinstance(algo, dict):
+                # the base class should have converted it to `_AlgorithmConfig` if feasible
+                # it is a `dict` here means an exception was raised during the convertion attempt
+                # we do the convertion again to show user the error message
+                _AlgorithmConfig(**algo)  # pylint: disable=not-a-mapping
+
+            if algo is not None and algo.name == '_none_':  # type: ignore
                 setattr(self, algo_type, None)
+
+        if self.advisor is not None:
+            assert self.tuner is None, '"advisor" is deprecated. You should only set "tuner".'
+            self.tuner = self.advisor
+            self.advisor = None
 
         super()._canonicalize([self])
 
@@ -159,11 +188,11 @@ class ExperimentConfig(ConfigBase):
         # currently I have only seen one issue of this kind
         #Path(self.experiment_working_directory).mkdir(parents=True, exist_ok=True)
 
-        utils.validate_gpu_indices(self.tuner_gpu_indices)
+        if type(self).__name__ != 'NasExperimentConfig':
+            utils.validate_gpu_indices(self.tuner_gpu_indices)
 
-        tuner_cnt = (self.tuner is not None) + (self.advisor is not None)
-        if tuner_cnt != 1:
-            raise ValueError('ExperimentConfig: tuner and advisor must be set one')
+            if self.tuner is None:
+                raise ValueError('ExperimentConfig: tuner must be set')
 
 def _load_search_space_file(search_space_path):
     # FIXME

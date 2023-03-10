@@ -15,6 +15,7 @@ from io import BytesIO
 import json
 import os
 from pathlib import Path
+import platform
 import shutil
 import subprocess
 import sys
@@ -23,8 +24,15 @@ import traceback
 from zipfile import ZipFile
 
 
-node_version = 'v16.13.2'
-yarn_version = 'v1.22.10'
+node_version = 'v18.12.1'
+yarn_version = 'v1.22.19'
+
+def _print(*args, color='cyan'):
+    color_code = {'yellow': 33, 'cyan': 36}[color]
+    if sys.platform == 'win32':
+        print(*args, flush=True)
+    else:
+        print(f'\033[1;{color_code}m#', *args, '\033[0m', flush=True)
 
 def _get_jupyter_lab_version():
     try:
@@ -32,6 +40,51 @@ def _get_jupyter_lab_version():
         return jupyterlab.__version__
     except ImportError:
         return '3.x'
+
+def _get_glibc_minor_version():  # type: () -> int | None
+    try:
+        from pip._internal.utils.glibc import glibc_version_string
+        glibc_version = glibc_version_string()
+        if glibc_version is None:
+            return None
+        glibc_major, glibc_minor = map(int, glibc_version.split('.'))
+        if glibc_major < 2:
+            raise RuntimeError('Unsupported glibc version: ' + glibc_version)
+        elif glibc_major == 2:
+            _print(f'Detected glibc version: {glibc_version}')
+            return glibc_minor
+        return None
+    except ImportError:
+        _print('Unsupported pip version. Assuming glibc not found.', color='yellow')
+        return None
+
+def _get_node_downloader():
+    if platform.machine() == 'x86_64':
+        glibc_minor = _get_glibc_minor_version()
+        if glibc_minor is None or glibc_minor >= 28:
+            _arch = 'x64'
+        elif glibc_minor >= 27:
+            _print('Detected deprecated glibc version < 2.28. Please upgrade as soon as possible.', color='yellow')
+            _arch = 'glibc-2.27'
+        else:
+            _print('glibc version is too low. We will try to use the node version compiled with glibc 2.23, '
+                   'but it might not work.', color='yellow')
+            _print('Please check your glibc version by running `ldd --version`, and upgrade it if necessary.',
+                   color='yellow')
+            _arch = 'glibc-2.23'
+    else:
+        _arch = platform.machine()
+
+    if _arch.startswith('glibc'):
+        node_legacy_version = 'v18.12.1'  # We might not upgrade node version for legacy builds every time.
+        node_spec = f'node-{node_legacy_version}-{sys.platform}-x64'
+        node_download_url = f'https://nni.blob.core.windows.net/cache/toolchain/node-{node_legacy_version}-{sys.platform}-{_arch}.tar.gz'
+        node_extractor = lambda data: tarfile.open(fileobj=BytesIO(data), mode='r:gz')
+    else:
+        node_spec = f'node-{node_version}-{sys.platform}-' + _arch
+        node_download_url = f'https://nodejs.org/dist/{node_version}/{node_spec}.tar.xz'
+        node_extractor = lambda data: tarfile.open(fileobj=BytesIO(data), mode='r:xz')
+    return node_download_url, node_spec, node_extractor
 
 jupyter_lab_major_version = _get_jupyter_lab_version().split('.')[0]
 
@@ -56,12 +109,13 @@ def build(release):
         symlink_nni_node()
     restore_package()
 
-def clean(clean_all=False):
+def clean():
     """
     Remove TypeScript-related intermediate files.
     Python intermediate files are not touched here.
     """
     shutil.rmtree('nni_node', ignore_errors=True)
+    shutil.rmtree('toolchain', ignore_errors=True)
 
     for file_or_dir in generated_files:
         path = Path(file_or_dir)
@@ -70,21 +124,18 @@ def clean(clean_all=False):
         elif path.is_dir():
             shutil.rmtree(path)
 
-    if clean_all:
-        shutil.rmtree('toolchain', ignore_errors=True)
-
 
 if sys.platform == 'linux' or sys.platform == 'darwin':
     node_executable = 'node'
-    node_spec = f'node-{node_version}-{sys.platform}-x64'
-    node_download_url = f'https://nodejs.org/dist/{node_version}/{node_spec}.tar.xz'
-    node_extractor = lambda data: tarfile.open(fileobj=BytesIO(data), mode='r:xz')
+    node_download_url, node_spec, node_extractor = _get_node_downloader()
     node_executable_in_tarball = 'bin/node'
+
+    npm_executable = 'bin/npm'
 
     yarn_executable = 'yarn'
     yarn_download_url = f'https://github.com/yarnpkg/yarn/releases/download/{yarn_version}/yarn-{yarn_version}.tar.gz'
 
-    path_env_seperator = ':'
+    path_env_separator = ':'
 
 elif sys.platform == 'win32':
     node_executable = 'node.exe'
@@ -93,10 +144,12 @@ elif sys.platform == 'win32':
     node_extractor = lambda data: ZipFile(BytesIO(data))
     node_executable_in_tarball = 'node.exe'
 
+    npm_executable = 'npm.cmd'
+
     yarn_executable = 'yarn.cmd'
     yarn_download_url = f'https://github.com/yarnpkg/yarn/releases/download/{yarn_version}/yarn-{yarn_version}.tar.gz'
 
-    path_env_seperator = ';'
+    path_env_separator = ';'
 
 else:
     raise RuntimeError('Unsupported system')
@@ -169,8 +222,8 @@ def compile_ts(release):
     Use yarn to download dependencies and compile TypeScript code.
     """
     _print('Building NNI manager')
-    _yarn('ts/nni_manager')
-    _yarn('ts/nni_manager', 'build')
+    _npm('ts/nni_manager', 'install')
+    _npm('ts/nni_manager', 'run', 'build')
     # todo: I don't think these should be here
     shutil.rmtree('ts/nni_manager/dist/config', ignore_errors=True)
     shutil.copytree('ts/nni_manager/config', 'ts/nni_manager/dist/config')
@@ -183,16 +236,14 @@ def compile_ts(release):
         _yarn('ts/webui', 'build')
 
     _print('Building JupyterLab extension')
-    if release:
+    try:
         _yarn('ts/jupyter_extension')
         _yarn('ts/jupyter_extension', 'build')
-    else:
-        try:
-            _yarn('ts/jupyter_extension')
-            _yarn('ts/jupyter_extension', 'build')
-        except Exception:
-            _print('Failed to build JupyterLab extension, skip for develop mode', color='yellow')
-            _print(traceback.format_exc(), color='yellow')
+    except Exception:
+        if release:
+            raise
+        _print('Failed to build JupyterLab extension, skip for develop mode', color='yellow')
+        _print(traceback.format_exc(), color='yellow')
 
 
 def symlink_nni_node():
@@ -225,12 +276,18 @@ def copy_nni_node(version):
     """
     _print('Copying files')
 
-    # copytree(..., dirs_exist_ok=True) is not supported by Python 3.6
-    for path in Path('ts/nni_manager/dist').iterdir():
-        if path.is_dir():
-            shutil.copytree(path, Path('nni_node', path.name))
-        elif path.name != 'nni_manager.tsbuildinfo':
-            shutil.copyfile(path, Path('nni_node', path.name))
+    if sys.version_info >= (3, 8):
+        shutil.copytree('ts/nni_manager/dist', 'nni_node', dirs_exist_ok=True)
+    else:
+        for item in os.listdir('ts/nni_manager/dist'):
+            subsrc = os.path.join('ts/nni_manager/dist', item)
+            subdst = os.path.join('nni_node', item)
+            if os.path.isdir(subsrc):
+                shutil.copytree(subsrc, subdst)
+            else:
+                shutil.copy2(subsrc, subdst)
+    shutil.copyfile('ts/nni_manager/package-lock.json', 'nni_node/package-lock.lock')
+    Path('nni_node/nni_manager.tsbuildinfo').unlink()
 
     package_json = json.load(open('ts/nni_manager/package.json'))
     if version:
@@ -239,8 +296,13 @@ def copy_nni_node(version):
         package_json['version'] = version
     json.dump(package_json, open('nni_node/package.json', 'w'), indent=2)
 
+    if sys.platform == 'win32':
+        # On Windows, manually install node-gyp for sqlite3.
+        _npm('ts/nni_manager', 'install', '--global', 'node-gyp')
+
     # reinstall without development dependencies
-    _yarn('ts/nni_manager', '--prod', '--cwd', str(Path('nni_node').resolve()))
+    prod_path = Path('nni_node').resolve()
+    _yarn(str(prod_path), 'install', '--production')
 
     shutil.copytree('ts/webui/build', 'nni_node/static')
 
@@ -253,14 +315,23 @@ def copy_nni_node(version):
 
 _yarn_env = dict(os.environ)
 # `Path('nni_node').resolve()` does not work on Windows if the directory not exists
-_yarn_env['PATH'] = str(Path().resolve() / 'nni_node') + path_env_seperator + os.environ['PATH']
+_yarn_env['PATH'] = str(Path().resolve() / 'nni_node') + path_env_separator + os.environ['PATH']
 _yarn_path = Path().resolve() / 'toolchain/yarn/bin' / yarn_executable
+_npm_path = Path().resolve() / 'toolchain/node' / npm_executable
 
 def _yarn(path, *args):
+    _print('yarn ' + ' '.join(args) + f' (path: {path})')
     if os.environ.get('GLOBAL_TOOLCHAIN'):
         subprocess.run(['yarn', *args], cwd=path, check=True)
     else:
         subprocess.run([str(_yarn_path), *args], cwd=path, check=True, env=_yarn_env)
+
+def _npm(path, *args):
+    _print('npm ' + ' '.join(args) + f' (path: {path})')
+    if os.environ.get('GLOBAL_TOOLCHAIN'):
+        subprocess.run(['npm', *args], cwd=path, check=True)
+    else:
+        subprocess.run([str(_npm_path), *args], cwd=path, check=True, env=_yarn_env)
 
 
 def _symlink(target_file, link_location):
@@ -268,14 +339,6 @@ def _symlink(target_file, link_location):
     link = Path(link_location)
     relative = os.path.relpath(target, link.parent)
     link.symlink_to(relative, target.is_dir())
-
-
-def _print(*args, color='cyan'):
-    color_code = {'yellow': 33, 'cyan': 36}[color]
-    if sys.platform == 'win32':
-        print(*args, flush=True)
-    else:
-        print(f'\033[1;{color_code}m#', *args, '\033[0m', flush=True)
 
 
 generated_files = [

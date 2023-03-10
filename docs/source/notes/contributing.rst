@@ -218,7 +218,7 @@ Our documentation is located under ``docs/`` folder. The following command can b
 .. code-block:: bash
 
    cd docs
-   make html
+   make en
 
 .. note::
 
@@ -275,13 +275,13 @@ Writing new documents
 
 Other than built-in directives provided by Sphinx, we also provide some custom directives:
 
-* ``.. cardlinkitem::``: A tutorial card, useful in :doc:`../tutorials`.
+* ``.. cardlinkitem::``: A tutorial card, useful in :doc:`/examples`.
 * |githublink_example| or |githublink_example_2|: reference a file on the GitHub. Linked to the same commit id as where the documentation is built.
 
 Writing new tutorials
 ^^^^^^^^^^^^^^^^^^^^^
 
-Our tutorials are powered by `sphinx-gallery <https://sphinx-gallery.github.io/>`. Sphinx-gallery is an extension that builds an HTML gallery of examples from any set of Python scripts.
+Our tutorials are powered by `sphinx-gallery <https://sphinx-gallery.github.io/>`_. Sphinx-gallery is an extension that builds an HTML gallery of examples from any set of Python scripts.
 
 To contribute a new tutorial, here are the steps to follow:
 
@@ -295,7 +295,7 @@ To contribute a new tutorial, here are the steps to follow:
 
    In case you prefer to write your tutorial in jupyter, you can use `this script <https://gist.github.com/chsasank/7218ca16f8d022e02a9c0deb94a310fe>`_ to convert the notebook to python file. After conversion and addition to the project, please make sure the sections headings etc are in logical order.
 
-3. Build the tutorials. Since some of the tutorials contain complex AutoML examples, it's very inefficient to build them over and over again. Therefore, we cache the built tutorials in ``docs/source/tutorials``, so that the unchanged tutorials won't be rebuilt. To trigger the build, run ``make html``. This will execute the tutorials and convert the scripts into HTML files. How long it takes depends on your tutorial. As ``make html`` is not very debug-friendly, we suggest making the script runnable by itself before using this building tool.
+3. Build the tutorials. Since some of the tutorials contain complex AutoML examples, it's very inefficient to build them over and over again. Therefore, we cache the built tutorials in ``docs/source/tutorials``, so that the unchanged tutorials won't be rebuilt. To trigger the build, run ``make en``. This will execute the tutorials and convert the scripts into HTML files. How long it takes depends on your tutorial. As ``make en`` is not very debug-friendly, we suggest making the script runnable by itself before using this building tool.
 
 .. note::
 
@@ -305,16 +305,31 @@ To contribute a new tutorial, here are the steps to follow:
    * `How to add images to notebooks <https://sphinx-gallery.github.io/stable/configuration.html#adding-images-to-notebooks>`_.
    * `How to reference a tutorial in documentation <https://sphinx-gallery.github.io/stable/advanced.html#cross-referencing>`_.
 
-Chinese translation
-^^^^^^^^^^^^^^^^^^^
+Translation (i18n)
+^^^^^^^^^^^^^^^^^^
 
-We only maintain `a partial set of documents <https://github.com/microsoft/nni/issues/4298>`_ with Chinese translation. If you intend to contribute more, follow the steps:
+We only maintain `a partial set of documents <https://github.com/microsoft/nni/issues/4298>`_ with translation. Currently, translation is provided in Simplified Chinese only.
 
-1. Add a ``xxx_zh.rst`` in the same folder where ``xxx.rst`` exists. 
-2. Run ``python tools/chineselink.py`` under ``docs`` folder, to generate a hash string in your created ``xxx_zh.rst``.
-3. Don't delete the hash string, add your translation after it.
+* If you want to update the translation of an existing document, please update messages in ``docs/source/locales``.
+* If you have updated a translated English document, we require that the corresponding translated documents to be updated (at least the update should be triggered). Please follow these steps:
 
-In case you modify an English document with Chinese translation already exists, you also need to run ``python tools/chineselink.py`` first to update the hash string, and update the Chinese translation contents accordingly.
+  1. Run ``make i18n`` under ``docs`` folder.
+  2. Verify that there are new messages in ``docs/source/locales``.
+  3. Translate the messages.
+
+* If you intend to translate a new document:
+
+  1. Update ``docs/source/conf.py`` to make ``gettext_documents`` include your document (probably adding a new regular expression).
+  2. See the steps above.
+
+
+To build the translated documentation (for example Chinese documentation), please run:
+
+.. code-block:: bash
+
+   make zh
+
+If you ever encountered problems for translation builds, try to remove the previous build via ``rm -r docs/build/``.
 
 .. _code-of-conduct:
 
@@ -327,3 +342,17 @@ For more information see the `Code of Conduct FAQ <https://opensource.microsoft.
 Most contributions require you to agree to a Contributor License Agreement (CLA) declaring that you have the right to, and actually do, grant us the rights to use your contribution. For details, visit https://cla.opensource.microsoft.com.
 
 When you submit a pull request, a CLA bot will automatically determine whether you need to provide a CLA and decorate the PR appropriately (e.g., status check, comment). Simply follow the instructions provided by the bot. You will only need to do this once across all repos using our CLA.
+
+We enforce every source files in this project to carry a license header. This should be added at the beginning of each file. Please contact the maintainer if you think there should be an exception.
+
+.. tabs::
+
+   .. code-tab:: python
+
+      # Copyright (c) Microsoft Corporation.
+      # Licensed under the MIT license.
+
+   .. code-tab:: typescript
+
+      // Copyright (c) Microsoft Corporation.
+      // Licensed under the MIT license.
